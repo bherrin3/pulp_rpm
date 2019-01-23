@@ -34,6 +34,27 @@ def set_up_module():
     require_pulp_plugins({'pulp_rpm'}, SkipTest)
 
 
+def get_repodata_repomd_xml(cfg, distributor, response_handler=None):
+    """Download the given repository's ``repodata/repomd.xml`` file.
+
+    :param cfg: Information about a Pulp
+        host.
+    :param distributor: A dict of information about a repository distributor.
+    :param response_handler: The callback function used by
+        ``pulp_smash.api.Client`` after downloading the ``repomd.xml`` file.
+        Defaults to :func:`xml_handler`. Use ``pulp_smash.api.safe_handler`` if
+        you want the raw response.
+    :returns: Whatever is dictated by ``response_handler``.
+    """
+    path = urljoin('/pulp/repos/', distributor['config']['relative_url'])
+    if not path.endswith('/'):
+        path += '/'
+    path = urljoin(path, 'repodata/repomd.xml')
+    if response_handler is None:
+        response_handler = xml_handler
+    return api.Client(cfg, response_handler).get(path)
+
+
 def gen_rpm_remote(url=None, **kwargs):
     """Return a semi-random dict for use in creating a RPM remote.
 
@@ -143,6 +164,82 @@ def gen_yum_config_file(cfg, repositoryid, baseurl, name, **kwargs):
         )
     return path
 
+
+def get_xml_content_from_fixture(fixture_path, data_type):
+    """Return the required xml content from the given ``fixture_path``.
+
+    This method should be called when an xml object of the following
+    is ``data_type`` are required.
+
+    * group
+    * filelists
+    * updateinfo
+    * group_gz
+    * modules
+    * primary
+    * other
+
+    This function should be called only when the data of type xml is
+    required. These ``data_type`` are present in repodata/repomd.xml
+    file. The function parses the ``repomd.xml`` file, gathers the
+    location of the data_type object, downloads the file and handles
+    it using the ``xml_handler`` and finally returns
+    ``xml.etree.Element`` of the root node.
+
+    :param fixture_path: Url path containing the fixtures.
+    :param data_type: The required xml file content that needs
+        to be downloaded.
+    :returns: An``xml.etree.Element`` object of the requested xml_file.
+
+    """
+    repo_path = urljoin(fixture_path, 'repodata/repomd.xml')
+    response = utils.http_get(repo_path)
+    root_elem = ElementTree.fromstring(response)
+
+    xpath = '{{{}}}data'.format(RPM_NAMESPACES['metadata/repo'])
+    data_elements = [
+        elem for elem in root_elem.findall(xpath)
+        if elem.get('type') == data_type
+    ]
+    xpath = '{{{}}}location'.format(RPM_NAMESPACES['metadata/repo'])
+    relative_path = str(data_elements[0].find(xpath).get('href'))
+    if 'xml' not in relative_path:
+        raise Exception(
+            "get_xml_content_from_fixture doesn't support non-xml data."
+        )
+    unit = requests.get(urljoin(fixture_path, relative_path))
+    return xml_handler(None, unit)
+
+
+def xml_handler(_, response):
+    """Decode a response as if it is XML.
+
+    This API response handler is useful for fetching XML files made available
+    by an RPM repository. When it handles a response, it will check the status
+    code of ``response``, decompress the response if the request URL ended in
+    ``.gz``, and return an ``xml.etree.Element`` instance built from the
+    response body.
+
+    Note:
+
+    * The entire response XML is loaded and parsed before returning, so this
+      may be unsafe for use with large XML files.
+    * The ``Content-Type`` and ``Content-Encoding`` response headers are
+      ignored due to https://pulp.plan.io/issues/1781.
+    """
+    response.raise_for_status()
+    if response.request.url.endswith('.gz'):  # See bug referenced in docstring
+        with io.BytesIO(response.content) as compressed:
+            with gzip.GzipFile(fileobj=compressed) as decompressed:
+                xml_bytes = decompressed.read()
+    else:
+        xml_bytes = response.content
+    # A well-formed XML document begins with a declaration like this:
+    #
+    #     <?xml version="1.0" encoding="UTF-8"?>
+    #
+    # We are trusting the parser to handle this correctly.
+    return ElementTree.fromstring(xml_bytes)
 
 skip_if = partial(selectors.skip_if, exc=SkipTest)
 """The ``@skip_if`` decorator, customized for unittest.
